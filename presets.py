@@ -40,6 +40,7 @@ class GenerationPreset:
     cfg_guidance_scale: float = 3.0
     seed: int = -1
     enable_fp8: bool = True
+    skip_memory_cleanup: bool = True
     
     # Image/video conditioning defaults
     image_strength: float = 1.0
@@ -113,6 +114,7 @@ class PresetManager:
             cfg_guidance_scale=3.0,
             seed=-1,
             enable_fp8=True,
+            skip_memory_cleanup=True,
             image_strength=1.0,
         )
         self._presets[DEFAULT_PRESET_NAME] = default
@@ -193,6 +195,7 @@ class PresetManager:
         cfg_guidance_scale: float = 3.0,
         seed: int = -1,
         enable_fp8: bool = True,
+        skip_memory_cleanup: bool = True,
         image_strength: float = 1.0,
     ) -> GenerationPreset:
         """Create a preset from individual settings (no prompt - that's a generation input)."""
@@ -212,6 +215,7 @@ class PresetManager:
             cfg_guidance_scale=cfg_guidance_scale,
             seed=seed,
             enable_fp8=enable_fp8,
+            skip_memory_cleanup=skip_memory_cleanup,
             image_strength=image_strength,
         )
         return preset

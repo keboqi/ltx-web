@@ -194,8 +194,9 @@ def _streaming_model(
     try:
         yield wrapped
     finally:
-        wrapped.teardown()
-        wrapped.to("meta")
+        if not _persistent_pipeline_models_enabled():
+            wrapped.teardown()
+            wrapped.to("meta")
         cleanup_memory()
 
 

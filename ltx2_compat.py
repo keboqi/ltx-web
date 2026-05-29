@@ -350,10 +350,23 @@ def create_pipeline(
     raise ValueError(f"Unknown pipeline type: {pipeline_type}")
 
 
-def release_pipeline_models(pipeline: Any | None) -> None:
-    """Release cached model modules held by a persistent LTX-2.3 pipeline."""
+def release_pipeline_models(pipeline: Any | None, *, force: bool = False) -> None:
+    """Release cached model modules held by a persistent LTX-2.3 pipeline.
+    
+    When ``LTX_KEEP_PIPELINE_MODELS`` is enabled and ``force`` is False,
+    this is a no-op so that cached sub-models survive between generations.
+    The ``force`` flag is used by explicit unload actions (e.g. shutdown,
+    user-initiated VRAM flush) to override persistence.
+    """
     if pipeline is None:
         return
+
+    # Respect persistence setting unless explicitly forced
+    if not force:
+        keep = os.environ.get("LTX_KEEP_PIPELINE_MODELS", "").lower()
+        if keep in {"1", "true", "yes", "on"}:
+            print("[release_pipeline_models] LTX_KEEP_PIPELINE_MODELS is ON — skipping release (use force=True to override)")
+            return
 
     try:
         import torch

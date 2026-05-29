@@ -588,7 +588,7 @@ def clear_vram_cache() -> str:
         
         # Clear the pipeline cache
         if _pipeline_cache["pipeline"] is not None:
-            release_pipeline_models(_pipeline_cache["pipeline"])
+            release_pipeline_models(_pipeline_cache["pipeline"], force=True)
         
         # Clear the pipeline reference
         _pipeline_cache["pipeline"] = None
@@ -672,7 +672,10 @@ def get_cached_pipeline(
         release_pipeline_models(_pipeline_cache["pipeline"])
         del _pipeline_cache["pipeline"]
         _pipeline_cache["pipeline"] = None
-        torch.cuda.empty_cache()
+        # Only empty cache if memory cleanup is enabled
+        keep = os.environ.get("LTX_KEEP_PIPELINE_MODELS", "").lower()
+        if keep not in {"1", "true", "yes", "on"}:
+            torch.cuda.empty_cache()
     
     # Create new pipeline
     progress(0.15, desc=f"Loading {pipeline_type} pipeline (first run is slower)...")
@@ -741,6 +744,7 @@ def generate_video(
     cfg_guidance_scale: float,
     seed: int,
     enable_fp8: bool,
+    skip_memory_cleanup: bool,
     input_image: Optional[Image.Image],
     image_strength: float,
     reference_video: Optional[str],
@@ -777,6 +781,9 @@ def generate_video(
     # Set environment variable for FP8 optimization
     if enable_fp8:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    
+    # Set Skip Memory Cleanup environment variable
+    os.environ["LTX_KEEP_PIPELINE_MODELS"] = "1" if skip_memory_cleanup else "0"
     
     try:
         # Get or create cached pipeline (keeps models in VRAM)
@@ -1097,6 +1104,9 @@ def create_ui():
                             enable_fp8 = gr.Checkbox(
                                 value=True, label="Enable FP8 Optimization (reduces memory)"
                             )
+                            skip_memory_cleanup = gr.Checkbox(
+                                value=True, label="Skip memory cleanup (keep pipeline models in VRAM between stages)"
+                            )
                         
                         # Image Conditioning
                         with gr.Accordion("🖼️ Image Conditioning", open=False):
@@ -1249,7 +1259,7 @@ def create_ui():
                     preset_manager = get_preset_manager()
                     preset = preset_manager.get_preset(preset_name)
                     if not preset:
-                        return [gr.update()] * 13 + [f"❌ Preset '{preset_name}' not found"]
+                        return [gr.update()] * 15 + [f"❌ Preset '{preset_name}' not found"]
                     
                     return [
                         gr.update(value=preset.pipeline_type),  # pipeline_type
@@ -1265,8 +1275,7 @@ def create_ui():
                         gr.update(value=preset.cfg_guidance_scale),  # cfg_guidance_scale
                         gr.update(value=preset.seed),  # seed
                         gr.update(value=preset.enable_fp8),  # enable_fp8
-                        gr.update(value=preset.prompt),  # prompt
-                        gr.update(value=preset.negative_prompt),  # negative_prompt
+                        gr.update(value=preset.skip_memory_cleanup),  # skip_memory_cleanup
                         gr.update(value=preset.image_strength),  # image_strength
                         f"✅ Loaded preset: **{preset_name}**"  # status
                     ]
@@ -1275,7 +1284,7 @@ def create_ui():
                     preset_name_input, pipeline_type, checkpoint_path, distilled_lora_path,
                     spatial_upsampler_path, gemma_path, height, width, num_frames,
                     frame_rate, num_inference_steps, cfg_guidance_scale, seed, enable_fp8,
-                    prompt, negative_prompt, image_strength
+                    skip_memory_cleanup, image_strength
                 ):
                     """Save current settings as a preset."""
                     preset_manager = get_preset_manager()
@@ -1294,8 +1303,6 @@ def create_ui():
                         distilled_lora_path=distilled_lora_path if distilled_lora_path else "None",
                         spatial_upsampler_path=spatial_upsampler_path if spatial_upsampler_path else "",
                         gemma_path=gemma_path if gemma_path else "./models/gemma",
-                        prompt=prompt if prompt else "",
-                        negative_prompt=negative_prompt if negative_prompt else "",
                         height=int(height),
                         width=int(width),
                         num_frames=int(num_frames),
@@ -1304,6 +1311,7 @@ def create_ui():
                         cfg_guidance_scale=float(cfg_guidance_scale),
                         seed=int(seed),
                         enable_fp8=bool(enable_fp8),
+                        skip_memory_cleanup=bool(skip_memory_cleanup),
                         image_strength=float(image_strength),
                     )
                     
@@ -1348,7 +1356,7 @@ def create_ui():
                         pipeline_type, checkpoint_path, distilled_lora_path,
                         spatial_upsampler_path, gemma_path, height, width, num_frames,
                         frame_rate, num_inference_steps, cfg_guidance_scale, seed, enable_fp8,
-                        prompt, negative_prompt, image_strength, preset_status
+                        skip_memory_cleanup, image_strength, preset_status
                     ]
                 )
                 
@@ -1358,7 +1366,7 @@ def create_ui():
                         preset_name_input, pipeline_type, checkpoint_path, distilled_lora_path,
                         spatial_upsampler_path, gemma_path, height, width, num_frames,
                         frame_rate, num_inference_steps, cfg_guidance_scale, seed, enable_fp8,
-                        prompt, negative_prompt, image_strength
+                        skip_memory_cleanup, image_strength
                     ],
                     outputs=[preset_dropdown, preset_status]
                 )
@@ -1393,6 +1401,7 @@ def create_ui():
                         cfg_guidance_scale,
                         seed,
                         enable_fp8,
+                        skip_memory_cleanup,
                         input_image,
                         image_strength,
                         reference_video,

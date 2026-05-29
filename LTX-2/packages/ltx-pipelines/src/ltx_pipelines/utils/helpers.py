@@ -33,7 +33,19 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def cleanup_memory() -> None:
+def cleanup_memory(*, force: bool = False) -> None:
+    """Free CUDA memory unless ``LTX_KEEP_PIPELINE_MODELS`` is enabled.
+
+    When persistence is on (env var set to ``1``/``true``/``yes``/``on``),
+    this function is a no-op so that model weights stay resident in VRAM.
+    Pass ``force=True`` to override (used for explicit user-initiated unloads).
+    """
+    if not force:
+        import os
+        keep = os.getenv("LTX_KEEP_PIPELINE_MODELS", "").lower()
+        if keep in {"1", "true", "yes", "on"}:
+            return
+
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()

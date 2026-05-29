@@ -562,6 +562,7 @@ class GenerationRequest(BaseModel):
     distilled_lora_path: Optional[str] = Field(default=None, description="Override distilled LoRA path")
     gemma_path: Optional[str] = Field(default=None, description="Override Gemma path")
     enable_fp8: Optional[bool] = Field(default=None, description="Override FP8 setting")
+    skip_memory_cleanup: Optional[bool] = Field(default=None, description="Override skip memory cleanup setting")
     
     # Generation settings (override preset values)
     height: Optional[int] = Field(default=None, ge=256, le=2048, description="Override height")
@@ -607,6 +608,7 @@ class PresetCreate(BaseModel):
     cfg_guidance_scale: float = Field(default=3.0, ge=1.0, le=15.0)
     seed: int = Field(default=-1)
     enable_fp8: bool = Field(default=True)
+    skip_memory_cleanup: bool = Field(default=True)
     image_strength: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
@@ -626,6 +628,7 @@ class PresetResponse(BaseModel):
     cfg_guidance_scale: float
     seed: int
     enable_fp8: bool
+    skip_memory_cleanup: bool
     image_strength: float
     # Model paths
     checkpoint_path: Optional[str] = None
@@ -648,6 +651,20 @@ class HealthResponse(BaseModel):
 # Pipeline Manager (handles caching)
 # ============================================================================
 
+def _normalize_path(p: Optional[str]) -> Optional[str]:
+    """Normalize a model path for reliable cache comparison.
+    
+    Resolves relative paths to absolute, normalizes slashes,
+    and lowercases on Windows to prevent spurious cache misses.
+    """
+    if not p or p == "None":
+        return p
+    try:
+        return str(Path(p).resolve())
+    except Exception:
+        return p
+
+
 class PipelineManager:
     """
     Manages pipeline loading and caching.
@@ -658,6 +675,7 @@ class PipelineManager:
         self._lock = threading.Lock()
         self._is_generating = False
         self._current_job_id: Optional[str] = None
+        self._skip_memory_cleanup = False
         self._pipeline_cache = {
             "pipeline": None,
             "pipeline_type": None,
@@ -704,6 +722,16 @@ class PipelineManager:
             }
         )
 
+    def set_skip_memory_cleanup(self, skip: bool):
+        """Update the skip_memory_cleanup flag."""
+        self._skip_memory_cleanup = skip
+        # Also sync the environment variable for vendor-level caching
+        os.environ["LTX_KEEP_PIPELINE_MODELS"] = "1" if skip else "0"
+        if skip:
+            print("[PipelineManager] VRAM persistence ENABLED — models stay in VRAM between stages and generations")
+        else:
+            print("[PipelineManager] VRAM persistence DISABLED — models freed after each stage")
+
     def unload_cached_pipeline(self) -> tuple[bool, str]:
         """Manually unload the cached pipeline and release VRAM."""
         with self._lock:
@@ -712,34 +740,48 @@ class PipelineManager:
             pipeline = self._pipeline_cache["pipeline"]
             if pipeline is None:
                 return True, "No pipeline is currently loaded."
-            release_pipeline_models(pipeline)
+            # force=True bypasses LTX_KEEP_PIPELINE_MODELS for explicit unloads
+            release_pipeline_models(pipeline, force=True)
             del pipeline
             self._reset_cache_metadata()
             return True, "Pipeline unloaded and VRAM cache cleared."
     
     def get_cached_pipeline(self, preset: GenerationPreset):
-        """Get or create cached pipeline."""
+        """Get or create cached pipeline.
+        
+        Uses normalized paths for comparison to prevent spurious cache misses
+        caused by relative vs absolute paths or different slash conventions.
+        """
         cache = self._pipeline_cache
         
+        # Normalize all paths for reliable comparison
         cache_valid = (
             cache["pipeline"] is not None
             and cache["pipeline_type"] == preset.pipeline_type
-            and cache["checkpoint_path"] == preset.checkpoint_path
-            and cache["spatial_upsampler_path"] == preset.spatial_upsampler_path
-            and cache["gemma_path"] == preset.gemma_path
-            and cache["distilled_lora_path"] == preset.distilled_lora_path
+            and cache["checkpoint_path"] == _normalize_path(preset.checkpoint_path)
+            and cache["spatial_upsampler_path"] == _normalize_path(preset.spatial_upsampler_path)
+            and cache["gemma_path"] == _normalize_path(preset.gemma_path)
+            and cache["distilled_lora_path"] == _normalize_path(preset.distilled_lora_path)
             and cache["enable_fp8"] == preset.enable_fp8
         )
         
         if cache_valid:
+            print("[PipelineManager] Cache HIT — reusing loaded pipeline")
             return cache["pipeline"], None
         
         # Clear old pipeline
         if cache["pipeline"] is not None:
-            release_pipeline_models(cache["pipeline"])
+            print("[PipelineManager] Cache MISS — pipeline settings changed, rebuilding")
+            if not self._skip_memory_cleanup:
+                release_pipeline_models(cache["pipeline"])
+            else:
+                print("[PipelineManager] skip_memory_cleanup enabled — skipping release_pipeline_models")
             del cache["pipeline"]
             self._reset_cache_metadata()
-            torch.cuda.empty_cache()
+            if not self._skip_memory_cleanup:
+                torch.cuda.empty_cache()
+        else:
+            print("[PipelineManager] No cached pipeline — building fresh")
         
         try:
             gemma_ready, gemma_error = validate_gemma_root(preset.gemma_path)
@@ -767,14 +809,15 @@ class PipelineManager:
                 enable_fp8=preset.enable_fp8,
             )
             
-            # Cache the pipeline
+            # Cache the pipeline with normalized paths for reliable future comparisons
             cache["pipeline"] = pipeline
             cache["pipeline_type"] = preset.pipeline_type
-            cache["checkpoint_path"] = preset.checkpoint_path
-            cache["spatial_upsampler_path"] = preset.spatial_upsampler_path
-            cache["gemma_path"] = preset.gemma_path
-            cache["distilled_lora_path"] = preset.distilled_lora_path
+            cache["checkpoint_path"] = _normalize_path(preset.checkpoint_path)
+            cache["spatial_upsampler_path"] = _normalize_path(preset.spatial_upsampler_path)
+            cache["gemma_path"] = _normalize_path(preset.gemma_path)
+            cache["distilled_lora_path"] = _normalize_path(preset.distilled_lora_path)
             cache["enable_fp8"] = preset.enable_fp8
+            print(f"[PipelineManager] Pipeline cached: type={preset.pipeline_type}, fp8={preset.enable_fp8}")
             
             return pipeline, None
             
@@ -1174,6 +1217,8 @@ def _generate_video_internal(
         preset.gemma_path = request.gemma_path
     if request.enable_fp8 is not None:
         preset.enable_fp8 = request.enable_fp8
+    if request.skip_memory_cleanup is not None:
+        preset.skip_memory_cleanup = request.skip_memory_cleanup
 
     if preset.pipeline_type in LTX23_SPECIALIZED_PIPELINE_TYPES:
         raise ValueError(
@@ -1215,6 +1260,9 @@ def _generate_video_internal(
     # Set FP8 optimization
     if preset.enable_fp8:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    
+    # Configure VRAM persistence (skip memory cleanup between stages)
+    _pipeline_manager.set_skip_memory_cleanup(preset.skip_memory_cleanup)
     
     # Get pipeline from cache
     progress_callback({"type": "stage", "stage": "loading_pipeline", "message": "Loading pipeline..."})
@@ -1391,6 +1439,7 @@ async def list_presets():
                 cfg_guidance_scale=preset.cfg_guidance_scale,
                 seed=preset.seed,
                 enable_fp8=preset.enable_fp8,
+                skip_memory_cleanup=preset.skip_memory_cleanup,
                 image_strength=preset.image_strength,
                 checkpoint_path=preset.checkpoint_path,
                 spatial_upsampler_path=preset.spatial_upsampler_path,
@@ -1425,6 +1474,7 @@ async def get_preset(preset_name: str):
         cfg_guidance_scale=preset.cfg_guidance_scale,
         seed=preset.seed,
         enable_fp8=preset.enable_fp8,
+        skip_memory_cleanup=preset.skip_memory_cleanup,
         image_strength=preset.image_strength,
         checkpoint_path=preset.checkpoint_path,
         spatial_upsampler_path=preset.spatial_upsampler_path,
@@ -1458,6 +1508,7 @@ async def create_preset(preset_data: PresetCreate):
         cfg_guidance_scale=preset_data.cfg_guidance_scale,
         seed=preset_data.seed,
         enable_fp8=preset_data.enable_fp8,
+        skip_memory_cleanup=preset_data.skip_memory_cleanup,
         image_strength=preset_data.image_strength,
     )
     
@@ -1478,6 +1529,7 @@ async def create_preset(preset_data: PresetCreate):
         cfg_guidance_scale=preset.cfg_guidance_scale,
         seed=preset.seed,
         enable_fp8=preset.enable_fp8,
+        skip_memory_cleanup=preset.skip_memory_cleanup,
         image_strength=preset.image_strength,
         checkpoint_path=preset.checkpoint_path,
         spatial_upsampler_path=preset.spatial_upsampler_path,
@@ -1512,6 +1564,7 @@ async def update_preset(preset_name: str, preset_data: PresetCreate):
         cfg_guidance_scale=preset_data.cfg_guidance_scale,
         seed=preset_data.seed,
         enable_fp8=preset_data.enable_fp8,
+        skip_memory_cleanup=preset_data.skip_memory_cleanup,
         image_strength=preset_data.image_strength,
     )
     preset.created_at = existing.created_at
@@ -1533,6 +1586,7 @@ async def update_preset(preset_name: str, preset_data: PresetCreate):
         cfg_guidance_scale=preset.cfg_guidance_scale,
         seed=preset.seed,
         enable_fp8=preset.enable_fp8,
+        skip_memory_cleanup=preset.skip_memory_cleanup,
         image_strength=preset.image_strength,
         checkpoint_path=preset.checkpoint_path,
         spatial_upsampler_path=preset.spatial_upsampler_path,
