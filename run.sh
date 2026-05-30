@@ -24,26 +24,7 @@ echo
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-ensure_ltx2_repo() {
-    if [ -d "LTX-2/.git" ]; then
-        if [ -n "$(git -C LTX-2 status --porcelain)" ]; then
-            echo "LTX-2 checkout has local WebUI compatibility patches; skipping automatic pull."
-        else
-            echo "Updating official LTX-2 checkout..."
-            git -C LTX-2 pull --ff-only
-        fi
-        return
-    fi
 
-    if [ -d "LTX-2" ]; then
-        LEGACY_DIR="LTX-2.legacy.$(date +%Y%m%d%H%M%S)"
-        echo "Found legacy vendored LTX-2 directory; moving it to ${LEGACY_DIR}..."
-        mv LTX-2 "$LEGACY_DIR"
-    fi
-
-    echo "Cloning official Lightricks/LTX-2..."
-    git clone "$LTX_REPO" LTX-2
-}
 
 ensure_torchaudio_abi() {
     echo "Checking torch/torchaudio ABI compatibility..."
@@ -63,8 +44,6 @@ ensure_torchaudio_abi() {
         exit 1
     fi
 }
-
-ensure_ltx2_repo
 
 if [ ! -f ".deps_installed" ]; then
     echo "Installing WebUI dependencies..."
