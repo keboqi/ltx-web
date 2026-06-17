@@ -24,6 +24,7 @@ import asyncio
 import threading
 import json
 import io
+import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -47,6 +48,7 @@ from ltx2_compat import (
     DEFAULT_CHECKPOINT_CANDIDATES,
     DEFAULT_CHECKPOINT_KEY,
     DEFAULT_DISTILLED_LORA_KEY,
+    DEFAULT_IC_LORA_KEY,
     DEFAULT_UPSAMPLER_CANDIDATES,
     DEFAULT_UPSAMPLER_KEY,
     GEMMA_REPO_ID,
@@ -72,6 +74,7 @@ from ltx2_compat import (
 MODELS_DIR = Path("./models")
 OUTPUTS_DIR = Path("./outputs")
 TEMPLATES_DIR = Path("./templates")
+AUDIO_VIDEO_RESOLUTION_MULTIPLE = 128
 
 # ============================================================================
 # Progress Callback System for SSE Streaming
@@ -478,6 +481,243 @@ def get_default_lora() -> Optional[str]:
     return None
 
 
+def _create_lipdub_reference_video(
+    image_path: str,
+    audio_path: str,
+    width: int,
+    height: int,
+    num_frames: int,
+    frame_rate: float,
+    temp_dir: Path,
+    audio_start_time: float = 0.0,
+    audio_max_duration: float | None = None,
+) -> str:
+    """Build a static reference video from a portrait image plus speech audio."""
+    duration = max(0.1, float(audio_max_duration or (float(num_frames) / max(float(frame_rate), 1.0))))
+    output_path = temp_dir / f"lipdub_ref_{uuid.uuid4().hex[:8]}.mp4"
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+
+        ffmpeg = get_ffmpeg_exe()
+    except Exception:
+        ffmpeg = "ffmpeg"
+
+    vf = (
+        f"scale={int(width)}:{int(height)}:force_original_aspect_ratio=increase,"
+        f"crop={int(width)}:{int(height)},format=yuv420p"
+    )
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loop",
+        "1",
+        "-framerate",
+        str(float(frame_rate)),
+        "-i",
+        image_path,
+    ]
+    if audio_start_time > 0:
+        cmd.extend(["-ss", f"{float(audio_start_time):.6f}"])
+    cmd.extend([
+        "-i",
+        audio_path,
+        "-t",
+        f"{duration:.6f}",
+        "-vf",
+        vf,
+        "-r",
+        str(float(frame_rate)),
+        "-frames:v",
+        str(int(num_frames)),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-af",
+        "apad",
+        "-c:a",
+        "aac",
+        str(output_path),
+    ])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create lipdub reference video: {result.stderr[-1200:]}")
+    return str(output_path)
+
+
+def _validate_audio_video_shape(width: int, height: int, num_frames: int) -> None:
+    if width % AUDIO_VIDEO_RESOLUTION_MULTIPLE != 0 or height % AUDIO_VIDEO_RESOLUTION_MULTIPLE != 0:
+        raise ValueError(
+            "Audio-guided pipelines require width and height to be multiples of 128. "
+            f"Got {width}x{height}."
+        )
+    if (int(num_frames) - 9) % 16 != 0:
+        raise ValueError(
+            "Audio-guided pipelines require num_frames to follow 16n+9 "
+            f"(for example 73, 121, 169). Got {num_frames}."
+        )
+
+
+def _conform_audio_latent_length(latent: torch.Tensor, expected_frames: int) -> torch.Tensor:
+    actual_frames = int(latent.shape[2])
+    if actual_frames > expected_frames:
+        return latent[:, :, :expected_frames]
+    if actual_frames < expected_frames:
+        pad_shape = list(latent.shape)
+        pad_shape[2] = expected_frames - actual_frames
+        padding = torch.zeros(pad_shape, device=latent.device, dtype=latent.dtype)
+        return torch.cat([latent, padding], dim=2)
+    return latent
+
+
+def _ensure_distilled_audio_conditioner(pipeline: Any):
+    audio_conditioner = getattr(pipeline, "audio_conditioner", None)
+    if audio_conditioner is not None:
+        return audio_conditioner
+
+    from ltx_pipelines.utils.blocks import AudioConditioner
+
+    checkpoint_path = getattr(getattr(pipeline, "stage", None), "_checkpoint_path", None)
+    if not checkpoint_path:
+        raise ValueError("The cached distilled pipeline does not expose its checkpoint path.")
+    audio_conditioner = AudioConditioner(checkpoint_path, pipeline.dtype, pipeline.device)
+    setattr(pipeline, "audio_conditioner", audio_conditioner)
+    return audio_conditioner
+
+
+def _run_distilled_portrait_lipsync(
+    pipeline: Any,
+    *,
+    prompt: str,
+    seed: int,
+    height: int,
+    width: int,
+    num_frames: int,
+    frame_rate: float,
+    images: List[Any],
+    audio_path: str,
+    audio_start_time: float,
+    audio_max_duration: float,
+    tiling_config: Any,
+):
+    """Fast portrait lipsync path that reuses the cached distilled pipeline modules."""
+    from ltx_core.components.noisers import GaussianNoiser
+    from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
+    from ltx_core.types import Audio, AudioLatentShape
+    from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, STAGE_2_DISTILLED_SIGMAS
+    from ltx_pipelines.utils.denoisers import SimpleDenoiser
+    from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings
+    from ltx_pipelines.utils.media_io import decode_audio_from_file
+    from ltx_pipelines.utils.types import ModalitySpec
+
+    assert_resolution(height=height, width=width, is_two_stage=True)
+    if not images:
+        raise ValueError("A portrait image is required for distilled portrait lipsync.")
+
+    generator = torch.Generator(device=pipeline.device).manual_seed(seed)
+    noiser = GaussianNoiser(generator=generator)
+    dtype = torch.bfloat16
+
+    portrait = images[0]._replace(frame_idx=0, strength=0.8)
+
+    (ctx_p,) = pipeline.prompt_encoder(
+        [prompt],
+        enhance_first_prompt=False,
+        enhance_prompt_image=portrait.path,
+    )
+    video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+
+    decoded_audio = decode_audio_from_file(
+        audio_path,
+        pipeline.device,
+        audio_start_time,
+        audio_max_duration,
+    )
+    if decoded_audio is None:
+        raise ValueError(f"Failed to decode audio from {audio_path}. Please check the file and try again.")
+
+    audio_conditioner = _ensure_distilled_audio_conditioner(pipeline)
+    encoded_audio_latent = audio_conditioner(lambda enc: vae_encode_audio(decoded_audio, enc, None))
+    audio_shape = AudioLatentShape.from_duration(
+        batch=1,
+        duration=float(num_frames) / float(frame_rate),
+        channels=8,
+        mel_bins=16,
+    )
+    encoded_audio_latent = _conform_audio_latent_length(encoded_audio_latent, audio_shape.frames)
+
+    stage_1_sigmas = DISTILLED_SIGMAS.to(dtype=torch.float32, device=pipeline.device)
+    stage_1_w, stage_1_h = width // 2, height // 2
+    stage_1_conditionings = pipeline.image_conditioner(
+        lambda enc: combined_image_conditionings(
+            images=[portrait],
+            height=stage_1_h,
+            width=stage_1_w,
+            video_encoder=enc,
+            dtype=dtype,
+            device=pipeline.device,
+        )
+    )
+
+    video_state, _audio_state = pipeline.stage(
+        denoiser=SimpleDenoiser(video_context, audio_context),
+        sigmas=stage_1_sigmas,
+        noiser=noiser,
+        width=stage_1_w,
+        height=stage_1_h,
+        frames=num_frames,
+        fps=frame_rate,
+        video=ModalitySpec(context=video_context, conditionings=stage_1_conditionings),
+        audio=ModalitySpec(
+            context=audio_context,
+            frozen=True,
+            noise_scale=0.0,
+            initial_latent=encoded_audio_latent,
+        ),
+    )
+
+    upscaled_video_latent = pipeline.upsampler(video_state.latent[:1])
+    stage_2_sigmas = STAGE_2_DISTILLED_SIGMAS.to(dtype=torch.float32, device=pipeline.device)
+    stage_2_conditionings = pipeline.image_conditioner(
+        lambda enc: combined_image_conditionings(
+            images=[portrait],
+            height=height,
+            width=width,
+            video_encoder=enc,
+            dtype=dtype,
+            device=pipeline.device,
+        )
+    )
+
+    video_state, _audio_state = pipeline.stage(
+        denoiser=SimpleDenoiser(video_context, audio_context),
+        sigmas=stage_2_sigmas,
+        noiser=noiser,
+        width=width,
+        height=height,
+        frames=num_frames,
+        fps=frame_rate,
+        video=ModalitySpec(
+            context=video_context,
+            conditionings=stage_2_conditionings,
+            noise_scale=stage_2_sigmas[0].item(),
+            initial_latent=upscaled_video_latent,
+        ),
+        audio=ModalitySpec(
+            context=audio_context,
+            frozen=True,
+            noise_scale=0.0,
+            initial_latent=encoded_audio_latent,
+        ),
+    )
+
+    decoded_video = pipeline.video_decoder(video_state.latent, tiling_config, generator)
+    original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
+    return decoded_video, original_audio
+
+
 def auto_download_required_models(preset) -> tuple:
     """
     Auto-download required models if not present.
@@ -485,6 +725,24 @@ def auto_download_required_models(preset) -> tuple:
     """
     checkpoint_path = preset.checkpoint_path
     upsampler_path = preset.spatial_upsampler_path
+
+    if preset.pipeline_type == "a2vid_two_stage":
+        dev_key = "ltx-2.3-22b-dev"
+        existing_dev = get_model_path(dev_key)
+        if existing_dev:
+            checkpoint_path = str(existing_dev)
+        else:
+            print(f"Auto-downloading audio-video checkpoint: {dev_key}")
+            checkpoint_path = download_model_file(dev_key)
+    elif preset.pipeline_type in {"distilled", "lipdub"}:
+        dev_filename = CHECKPOINTS["ltx-2.3-22b-dev"]["filename"]
+        if checkpoint_path and Path(checkpoint_path).name == dev_filename:
+            existing_distilled = get_model_path(DEFAULT_CHECKPOINT_KEY)
+            if existing_distilled:
+                checkpoint_path = str(existing_distilled)
+            else:
+                print(f"Auto-downloading default checkpoint: {DEFAULT_CHECKPOINT_KEY}")
+                checkpoint_path = download_model_file(DEFAULT_CHECKPOINT_KEY)
     
     # Check and download checkpoint
     if not checkpoint_path or not Path(checkpoint_path).exists():
@@ -508,17 +766,20 @@ def auto_download_required_models(preset) -> tuple:
                 upsampler_path = download_model_file(DEFAULT_UPSAMPLER_KEY)
 
     if preset.pipeline_type in PIPELINES_REQUIRING_DISTILLED_LORA:
+        required_lora_key = DEFAULT_IC_LORA_KEY if preset.pipeline_type == "lipdub" else DEFAULT_DISTILLED_LORA_KEY
+        required_lora_name = CHECKPOINTS[required_lora_key]["filename"]
         if (
             not preset.distilled_lora_path
             or preset.distilled_lora_path == "None"
+            or Path(preset.distilled_lora_path).name != required_lora_name
             or not Path(preset.distilled_lora_path).exists()
         ):
-            existing = get_default_lora()
+            existing = get_model_path(required_lora_key)
             if existing:
-                preset.distilled_lora_path = existing
+                preset.distilled_lora_path = str(existing)
             else:
-                print(f"Auto-downloading default distilled LoRA: {DEFAULT_DISTILLED_LORA_KEY}")
-                preset.distilled_lora_path = download_model_file(DEFAULT_DISTILLED_LORA_KEY)
+                print(f"Auto-downloading required LoRA: {required_lora_key}")
+                preset.distilled_lora_path = download_model_file(required_lora_key)
 
     if missing_gemma_files(preset.gemma_path):
         print(f"Auto-downloading Gemma text encoder: {GEMMA_REPO_ID}")
@@ -567,7 +828,7 @@ class GenerationRequest(BaseModel):
     # Generation settings (override preset values)
     height: Optional[int] = Field(default=None, ge=256, le=2048, description="Override height")
     width: Optional[int] = Field(default=None, ge=256, le=2048, description="Override width")
-    num_frames: Optional[int] = Field(default=None, ge=9, le=257, description="Override frame count")
+    num_frames: Optional[int] = Field(default=None, ge=9, le=1201, description="Override frame count")
     frame_rate: Optional[float] = Field(default=None, ge=8, le=60, description="Override FPS")
     num_inference_steps: Optional[int] = Field(default=None, ge=4, le=100, description="Override steps")
     cfg_guidance_scale: Optional[float] = Field(default=None, ge=1.0, le=15.0, description="Override CFG")
@@ -576,6 +837,12 @@ class GenerationRequest(BaseModel):
     
     # Multiple images support (new format)
     images: Optional[List[ImageInput]] = Field(default=None, description="List of image inputs with frame indices")
+
+    # Audio conditioning for A2V / lipsync-style generation
+    audio_base64: Optional[str] = Field(default=None, description="Base64 encoded audio file")
+    audio_filename: Optional[str] = Field(default=None, description="Original audio filename")
+    audio_start_time: float = Field(default=0.0, ge=0.0, description="Audio start time in seconds")
+    audio_max_duration: Optional[float] = Field(default=None, gt=0.0, description="Maximum audio duration in seconds")
     
     # Video conditioning for IC-LoRA pipeline
     video_conditioning: Optional[List[VideoConditioningInput]] = Field(
@@ -602,7 +869,7 @@ class PresetCreate(BaseModel):
     # Generation parameters (NO prompt/negative_prompt - those are generation inputs)
     height: int = Field(default=1024, ge=256, le=2048)
     width: int = Field(default=1536, ge=256, le=2048)
-    num_frames: int = Field(default=121, ge=9, le=257)
+    num_frames: int = Field(default=121, ge=9, le=1201)
     frame_rate: float = Field(default=24.0, ge=8, le=60)
     num_inference_steps: int = Field(default=30, ge=4, le=100)
     cfg_guidance_scale: float = Field(default=3.0, ge=1.0, le=15.0)
@@ -772,13 +1039,24 @@ class PipelineManager:
         # Clear old pipeline
         if cache["pipeline"] is not None:
             print("[PipelineManager] Cache MISS — pipeline settings changed, rebuilding")
-            if not self._skip_memory_cleanup:
+            previous_pipeline_type = cache["pipeline_type"]
+            pipeline_type_changed = previous_pipeline_type != preset.pipeline_type
+            crosses_a2v_checkpoint = "a2vid_two_stage" in {previous_pipeline_type, preset.pipeline_type}
+            should_empty_cache = False
+            if pipeline_type_changed and crosses_a2v_checkpoint:
+                print("[PipelineManager] A2V checkpoint boundary crossed - force-releasing previous pipeline")
+                release_pipeline_models(cache["pipeline"], force=True)
+                should_empty_cache = True
+            elif pipeline_type_changed:
+                print("[PipelineManager] Shared distilled pipeline switch - keeping resident model modules")
+            elif not self._skip_memory_cleanup:
                 release_pipeline_models(cache["pipeline"])
+                should_empty_cache = True
             else:
                 print("[PipelineManager] skip_memory_cleanup enabled — skipping release_pipeline_models")
             del cache["pipeline"]
             self._reset_cache_metadata()
-            if not self._skip_memory_cleanup:
+            if should_empty_cache:
                 torch.cuda.empty_cache()
         else:
             print("[PipelineManager] No cached pipeline — building fresh")
@@ -798,7 +1076,7 @@ class PipelineManager:
                     or preset.distilled_lora_path == "None"
                     or not Path(preset.distilled_lora_path).exists()
                 ):
-                    return None, "This pipeline requires a distilled LoRA. Download the LTX-2.3 distilled LoRA from Models."
+                    return None, "This pipeline requires a LoRA. Download the required LTX-2.3 LoRA from Models."
 
             pipeline = create_pipeline(
                 pipeline_type=preset.pipeline_type,
@@ -1029,6 +1307,7 @@ async def generate_video_stream(request: GenerationRequest):
     # Handle input images (multiple images with frame indices)
     image_inputs = []
     video_conditioning_inputs = []  # List of (path, strength)
+    audio_path = None
     temp_dir = OUTPUTS_DIR / "temp"
     temp_dir.mkdir(exist_ok=True)
     
@@ -1061,6 +1340,15 @@ async def generate_video_stream(request: GenerationRequest):
                 with open(video_path, 'wb') as f:
                     f.write(video_data)
                 video_conditioning_inputs.append((video_path, vid_input.strength))
+
+        if request.audio_base64:
+            audio_data = base64.b64decode(request.audio_base64)
+            suffix = Path(request.audio_filename or "").suffix.lower()
+            if suffix not in {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus"}:
+                suffix = ".wav"
+            audio_path = str(temp_dir / f"audio_{uuid.uuid4().hex[:8]}{suffix}")
+            with open(audio_path, "wb") as f:
+                f.write(audio_data)
                 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid input media: {e}")
@@ -1104,6 +1392,7 @@ async def generate_video_stream(request: GenerationRequest):
                     preset=preset,
                     image_inputs=image_inputs,
                     video_conditioning_inputs=video_conditioning_inputs,
+                    audio_path=audio_path,
                     progress_callback=send_progress,
                 )
                 
@@ -1172,6 +1461,7 @@ def _generate_video_with_progress(
     preset: GenerationPreset,
     image_inputs: List[tuple],
     video_conditioning_inputs: List[tuple],
+    audio_path: Optional[str],
     progress_callback,
 ) -> str:
     """Generate video with progress callbacks. Returns output path."""
@@ -1188,6 +1478,7 @@ def _generate_video_with_progress(
             preset=preset,
             image_inputs=image_inputs,
             video_conditioning_inputs=video_conditioning_inputs,
+            audio_path=audio_path,
             progress_callback=progress_callback,
         )
 
@@ -1198,6 +1489,7 @@ def _generate_video_internal(
     preset: GenerationPreset,
     image_inputs: List[tuple],
     video_conditioning_inputs: List[tuple],
+    audio_path: Optional[str],
     progress_callback,
 ) -> str:
     """Internal generation function."""
@@ -1251,6 +1543,17 @@ def _generate_video_internal(
     
     if not prompt:
         raise ValueError("Prompt is required")
+    uses_distilled_portrait_lipsync = bool(
+        preset.pipeline_type == "distilled" and audio_path and image_inputs
+    )
+    if preset.pipeline_type in {"a2vid_two_stage", "lipdub"} and not audio_path:
+        raise ValueError(f"Audio input is required for the {preset.pipeline_type} pipeline.")
+    if preset.pipeline_type == "lipdub" and not image_inputs:
+        raise ValueError("A portrait image is required for lipsync generation.")
+    if preset.pipeline_type == "distilled" and audio_path and not image_inputs:
+        raise ValueError("Audio-only generation requires the a2vid_two_stage pipeline.")
+    if preset.pipeline_type in {"a2vid_two_stage", "lipdub"} or uses_distilled_portrait_lipsync:
+        _validate_audio_video_shape(int(width), int(height), int(num_frames))
     
     # Handle seed
     if seed is None or seed < 0:
@@ -1288,14 +1591,17 @@ def _generate_video_internal(
     
     # Determine stage info based on pipeline type
     # Stage 2 always uses STAGE_2_DISTILLED_SIGMA_VALUES (4 values, tqdm uses sigmas[:-1] = 3 steps)
-    if preset.pipeline_type in GUIDANCELESS_PIPELINES:
+    if uses_distilled_portrait_lipsync:
+        stage_1_steps = 8
+        stage_2_steps = 3
+    elif preset.pipeline_type in GUIDANCELESS_PIPELINES:
         stage_1_steps = 8  # Distilled and IC-LoRA use 8 fixed sigmas (DISTILLED_SIGMA_VALUES)
         stage_2_steps = 3  # Stage 2 distilled sigmas
     elif preset.pipeline_type in ONE_STAGE_PIPELINES:
         stage_1_steps = num_inference_steps
         stage_2_steps = 0  # One-stage has no Stage 2
     else:
-        # ti2vid_two_stages, ti2vid_two_stages_hq, keyframe_interpolation
+        # a2vid_two_stage, ti2vid_two_stages, ti2vid_two_stages_hq, keyframe_interpolation
         stage_1_steps = num_inference_steps
         stage_2_steps = 3  # Stage 2 uses STAGE_2_DISTILLED_SIGMA_VALUES (3 steps)
     
@@ -1323,7 +1629,27 @@ def _generate_video_internal(
     )
     
     with torch.no_grad():
-        if preset.pipeline_type == "distilled":
+        if uses_distilled_portrait_lipsync:
+            audio_max_duration = (
+                float(request.audio_max_duration)
+                if request.audio_max_duration is not None
+                else int(num_frames) / float(frame_rate)
+            )
+            video, audio = _run_distilled_portrait_lipsync(
+                pipeline,
+                prompt=prompt,
+                seed=seed,
+                height=int(height),
+                width=int(width),
+                num_frames=int(num_frames),
+                frame_rate=float(frame_rate),
+                images=images,
+                audio_path=audio_path,
+                audio_start_time=float(request.audio_start_time),
+                audio_max_duration=audio_max_duration,
+                tiling_config=tiling_config,
+            )
+        elif preset.pipeline_type == "distilled":
             video, audio = pipeline(
                 prompt=prompt,
                 seed=seed,
@@ -1360,6 +1686,65 @@ def _generate_video_internal(
                 tiling_config=tiling_config,
                 enhance_prompt=False,
                 **guidance_kwargs,
+            )
+        elif preset.pipeline_type == "a2vid_two_stage":
+            from ltx_pipelines.utils.constants import DISTILLED_SIGMAS
+
+            audio_max_duration = (
+                float(request.audio_max_duration)
+                if request.audio_max_duration is not None
+                else int(num_frames) / float(frame_rate)
+            )
+            video, audio = pipeline(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                height=int(height),
+                width=int(width),
+                num_frames=int(num_frames),
+                frame_rate=float(frame_rate),
+                num_inference_steps=int(num_inference_steps),
+                video_guider_params=guidance_kwargs["video_guider_params"],
+                images=images,
+                audio_path=audio_path,
+                audio_start_time=float(request.audio_start_time),
+                audio_max_duration=audio_max_duration,
+                tiling_config=tiling_config,
+                enhance_prompt=False,
+                max_batch_size=1,
+                stage_1_sigmas=DISTILLED_SIGMAS,
+            )
+        elif preset.pipeline_type == "lipdub":
+            reference_video_path = _create_lipdub_reference_video(
+                image_path=images[0].path,
+                audio_path=audio_path,
+                width=int(width),
+                height=int(height),
+                num_frames=int(num_frames),
+                frame_rate=float(frame_rate),
+                temp_dir=Path(audio_path).parent,
+                audio_start_time=float(request.audio_start_time),
+                audio_max_duration=request.audio_max_duration,
+            )
+            try:
+                from ltx_pipelines.utils.media_io import get_videostream_metadata
+
+                ref_meta = get_videostream_metadata(reference_video_path)
+                ref_frames = max(9, ((int(ref_meta.frames) - 1) // 8) * 8 + 1)
+                video_chunks_number = get_video_chunks_number(ref_frames, tiling_config)
+            except Exception as exc:
+                print(f"[lipdub] Could not inspect reference video metadata: {exc}")
+
+            video, audio = pipeline(
+                prompt=prompt,
+                seed=seed,
+                height=int(height),
+                width=int(width),
+                images=images[:1],
+                reference_video_path=reference_video_path,
+                reference_strength=1.0,
+                tiling_config=tiling_config,
+                enhance_prompt=False,
             )
         else:
             video, audio = pipeline(

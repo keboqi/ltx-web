@@ -32,6 +32,7 @@ GEMMA_REQUIRED_FILES = (
 DEFAULT_CHECKPOINT_KEY = "ltx-2.3-22b-distilled-1.1"
 DEFAULT_UPSAMPLER_KEY = "ltx-2.3-spatial-upscaler-x2-1.1"
 DEFAULT_DISTILLED_LORA_KEY = "ltx-2.3-22b-distilled-lora-384-1.1"
+DEFAULT_IC_LORA_KEY = "ltx-2.3-22b-ic-lora-union-control-ref0.5"
 
 DEFAULT_CHECKPOINT_CANDIDATES = [
     "ltx-2.3-22b-distilled-1.1.safetensors",
@@ -45,18 +46,18 @@ DEFAULT_UPSAMPLER_CANDIDATES = [
 
 SUPPORTED_PIPELINE_TYPES = {
     "distilled",
+    "a2vid_two_stage",
     "ti2vid_two_stages",
     "ti2vid_two_stages_hq",
     "ti2vid_one_stage",
     "ic_lora",
     "keyframe_interpolation",
+    "lipdub",
 }
 
 LTX23_SPECIALIZED_PIPELINE_TYPES = {
-    "a2vid_two_stage",
     "retake",
     "hdr_ic_lora",
-    "lipdub",
 }
 
 ALL_LTX23_PIPELINE_TYPES = SUPPORTED_PIPELINE_TYPES | LTX23_SPECIALIZED_PIPELINE_TYPES
@@ -76,16 +77,20 @@ PIPELINE_DESCRIPTIONS = {
 
 PIPELINES_REQUIRING_UPSAMPLER = {
     "distilled",
+    "a2vid_two_stage",
     "ic_lora",
     "ti2vid_two_stages",
     "ti2vid_two_stages_hq",
     "keyframe_interpolation",
+    "lipdub",
 }
 
 PIPELINES_REQUIRING_DISTILLED_LORA = {
+    "a2vid_two_stage",
     "ti2vid_two_stages",
     "ti2vid_two_stages_hq",
     "keyframe_interpolation",
+    "lipdub",
 }
 
 ONE_STAGE_PIPELINES = {"ti2vid_one_stage"}
@@ -296,6 +301,18 @@ def create_pipeline(
             quantization=quantization,
         )
 
+    if pipeline_type == "a2vid_two_stage":
+        from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
+
+        return A2VidPipelineTwoStage(
+            checkpoint_path=checkpoint_path,
+            distilled_lora=make_lora_list(lora_path),
+            spatial_upsampler_path=spatial_upsampler_path,
+            gemma_root=gemma_path,
+            loras=[],
+            quantization=quantization,
+        )
+
     if pipeline_type == "ti2vid_two_stages_hq":
         from ltx_pipelines.ti2vid_two_stages_hq import TI2VidTwoStagesHQPipeline
 
@@ -332,6 +349,20 @@ def create_pipeline(
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root=gemma_path,
             loras=make_lora_list(lora_path),
+            quantization=quantization,
+        )
+
+    if pipeline_type == "lipdub":
+        from ltx_pipelines.lipdub import LipDubPipeline
+
+        loras = make_lora_list(lora_path)
+        if len(loras) != 1:
+            raise ValueError("LipDubPipeline requires exactly one IC-LoRA.")
+        return LipDubPipeline(
+            distilled_checkpoint_path=checkpoint_path,
+            spatial_upsampler_path=spatial_upsampler_path,
+            gemma_root=gemma_path,
+            ic_lora=loras[0],
             quantization=quantization,
         )
 
