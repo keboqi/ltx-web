@@ -33,6 +33,7 @@ DEFAULT_CHECKPOINT_KEY = "ltx-2.3-22b-distilled-1.1"
 DEFAULT_UPSAMPLER_KEY = "ltx-2.3-spatial-upscaler-x2-1.1"
 DEFAULT_DISTILLED_LORA_KEY = "ltx-2.3-22b-distilled-lora-384-1.1"
 DEFAULT_IC_LORA_KEY = "ltx-2.3-22b-ic-lora-union-control-ref0.5"
+DEFAULT_INGREDIENTS_IC_LORA_KEY = "ltx-2.3-22b-ic-lora-ingredients-0.9"
 
 DEFAULT_CHECKPOINT_CANDIDATES = [
     "ltx-2.3-22b-distilled-1.1.safetensors",
@@ -87,6 +88,7 @@ PIPELINES_REQUIRING_UPSAMPLER = {
 
 PIPELINES_REQUIRING_DISTILLED_LORA = {
     "a2vid_two_stage",
+    "ic_lora",
     "ti2vid_two_stages",
     "ti2vid_two_stages_hq",
     "keyframe_interpolation",
@@ -168,6 +170,27 @@ CHECKPOINTS: dict[str, dict[str, str]] = {
         "type": "lora",
         "repo_id": "Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control",
     },
+    "ltx-2.3-22b-ic-lora-ingredients-0.9": {
+        "filename": "ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors",
+        "size": "adapter",
+        "description": "LTX-2.3 IC-LoRA Ingredients/reference-sheet adapter",
+        "type": "lora",
+        "repo_id": "Lightricks/LTX-2.3-22b-IC-LoRA-Ingredients",
+    },
+    "ltx-2.3-22b-ic-lora-day-to-night-0.9": {
+        "filename": "ltx-2.3-22b-ic-lora-day-to-night-0.9.safetensors",
+        "size": "adapter",
+        "description": "LTX-2.3 IC-LoRA day-to-night relighting adapter",
+        "type": "lora",
+        "repo_id": "Lightricks/LTX-2.3-22b-IC-LoRA-Day-To-Night",
+    },
+    "ltx-2.3-22b-ic-lora-water-simulation-0.9": {
+        "filename": "ltx-2.3-22b-ic-lora-water-simulation-0.9.safetensors",
+        "size": "adapter",
+        "description": "LTX-2.3 IC-LoRA water simulation adapter",
+        "type": "lora",
+        "repo_id": "Lightricks/LTX-2.3-22b-IC-LoRA-Water-Simulation",
+    },
 }
 
 
@@ -238,14 +261,14 @@ def build_quantization_policy(enable_fp8: bool, checkpoint_path: str):
     return QuantizationKind.FP8_CAST.to_policy(checkpoint_path)
 
 
-def make_lora_list(lora_path: str | None):
+def make_lora_list(lora_path: str | None, strength: float = 1.0):
     """Create a single LoRA descriptor list from a WebUI path field."""
     if not lora_path or lora_path == "None" or not Path(lora_path).exists():
         return []
 
     from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 
-    return [LoraPathStrengthAndSDOps(lora_path, 1.0, LTXV_LORA_COMFY_RENAMING_MAP)]
+    return [LoraPathStrengthAndSDOps(lora_path, float(strength), LTXV_LORA_COMFY_RENAMING_MAP)]
 
 
 def make_image_conditioning(path: str | Path, frame_idx: int, strength: float, crf: int | None = None):
@@ -265,6 +288,7 @@ def create_pipeline(
     gemma_path: str,
     lora_path: str | None,
     enable_fp8: bool,
+    lora_strength: float = 1.0,
 ):
     """Instantiate a local LTX-2.3 pipeline for the selected WebUI mode."""
     if pipeline_type not in SUPPORTED_PIPELINE_TYPES:
@@ -294,7 +318,7 @@ def create_pipeline(
 
         return TI2VidTwoStagesPipeline(
             checkpoint_path=checkpoint_path,
-            distilled_lora=make_lora_list(lora_path),
+            distilled_lora=make_lora_list(lora_path, lora_strength),
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root=gemma_path,
             loras=[],
@@ -306,7 +330,7 @@ def create_pipeline(
 
         return A2VidPipelineTwoStage(
             checkpoint_path=checkpoint_path,
-            distilled_lora=make_lora_list(lora_path),
+            distilled_lora=make_lora_list(lora_path, lora_strength),
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root=gemma_path,
             loras=[],
@@ -316,7 +340,7 @@ def create_pipeline(
     if pipeline_type == "ti2vid_two_stages_hq":
         from ltx_pipelines.ti2vid_two_stages_hq import TI2VidTwoStagesHQPipeline
 
-        distilled_lora = make_lora_list(lora_path)
+        distilled_lora = make_lora_list(lora_path, lora_strength)
         if not distilled_lora:
             raise ValueError("TI2VidTwoStagesHQPipeline requires a distilled LoRA.")
 
@@ -348,14 +372,14 @@ def create_pipeline(
             distilled_checkpoint_path=checkpoint_path,
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root=gemma_path,
-            loras=make_lora_list(lora_path),
+            loras=make_lora_list(lora_path, lora_strength),
             quantization=quantization,
         )
 
     if pipeline_type == "lipdub":
         from ltx_pipelines.lipdub import LipDubPipeline
 
-        loras = make_lora_list(lora_path)
+        loras = make_lora_list(lora_path, lora_strength)
         if len(loras) != 1:
             raise ValueError("LipDubPipeline requires exactly one IC-LoRA.")
         return LipDubPipeline(
@@ -371,7 +395,7 @@ def create_pipeline(
 
         return KeyframeInterpolationPipeline(
             checkpoint_path=checkpoint_path,
-            distilled_lora=make_lora_list(lora_path),
+            distilled_lora=make_lora_list(lora_path, lora_strength),
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root=gemma_path,
             loras=[],

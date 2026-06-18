@@ -49,6 +49,7 @@ from ltx2_compat import (
     DEFAULT_CHECKPOINT_KEY,
     DEFAULT_DISTILLED_LORA_KEY,
     DEFAULT_IC_LORA_KEY,
+    DEFAULT_INGREDIENTS_IC_LORA_KEY,
     DEFAULT_UPSAMPLER_CANDIDATES,
     DEFAULT_UPSAMPLER_KEY,
     GEMMA_REPO_ID,
@@ -547,6 +548,60 @@ def _create_lipdub_reference_video(
     return str(output_path)
 
 
+def _create_static_reference_video(
+    image_path: str,
+    width: int,
+    height: int,
+    num_frames: int,
+    frame_rate: float,
+    temp_dir: Path,
+) -> str:
+    """Loop a still reference image into the static video expected by IC-LoRA."""
+    duration = max(0.1, float(num_frames) / max(float(frame_rate), 1.0))
+    output_path = temp_dir / f"ic_lora_ref_{uuid.uuid4().hex[:8]}.mp4"
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+
+        ffmpeg = get_ffmpeg_exe()
+    except Exception:
+        ffmpeg = "ffmpeg"
+
+    vf = (
+        f"scale={int(width)}:{int(height)}:force_original_aspect_ratio=increase,"
+        f"crop={int(width)}:{int(height)},format=yuv420p"
+    )
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loop",
+        "1",
+        "-framerate",
+        str(float(frame_rate)),
+        "-i",
+        image_path,
+        "-t",
+        f"{duration:.6f}",
+        "-vf",
+        vf,
+        "-r",
+        str(float(frame_rate)),
+        "-frames:v",
+        str(int(num_frames)),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create IC-LoRA reference video: {result.stderr[-1200:]}")
+    return str(output_path)
+
+
 def _validate_audio_video_shape(width: int, height: int, num_frames: int) -> None:
     if width % AUDIO_VIDEO_RESOLUTION_MULTIPLE != 0 or height % AUDIO_VIDEO_RESOLUTION_MULTIPLE != 0:
         raise ValueError(
@@ -718,7 +773,7 @@ def _run_distilled_portrait_lipsync(
     return decoded_video, original_audio
 
 
-def auto_download_required_models(preset) -> tuple:
+def auto_download_required_models(preset, ic_lora_model_key: str | None = None) -> tuple:
     """
     Auto-download required models if not present.
     Returns (checkpoint_path, upsampler_path) or raises error.
@@ -734,7 +789,7 @@ def auto_download_required_models(preset) -> tuple:
         else:
             print(f"Auto-downloading audio-video checkpoint: {dev_key}")
             checkpoint_path = download_model_file(dev_key)
-    elif preset.pipeline_type in {"distilled", "lipdub"}:
+    elif preset.pipeline_type in {"distilled", "ic_lora", "lipdub"}:
         dev_filename = CHECKPOINTS["ltx-2.3-22b-dev"]["filename"]
         if checkpoint_path and Path(checkpoint_path).name == dev_filename:
             existing_distilled = get_model_path(DEFAULT_CHECKPOINT_KEY)
@@ -766,9 +821,23 @@ def auto_download_required_models(preset) -> tuple:
                 upsampler_path = download_model_file(DEFAULT_UPSAMPLER_KEY)
 
     if preset.pipeline_type in PIPELINES_REQUIRING_DISTILLED_LORA:
-        required_lora_key = DEFAULT_IC_LORA_KEY if preset.pipeline_type == "lipdub" else DEFAULT_DISTILLED_LORA_KEY
+        keep_existing_ic_lora = False
+        if preset.pipeline_type == "lipdub":
+            required_lora_key = DEFAULT_IC_LORA_KEY
+        elif preset.pipeline_type == "ic_lora":
+            required_lora_key = ic_lora_model_key or DEFAULT_INGREDIENTS_IC_LORA_KEY
+            if required_lora_key not in CHECKPOINTS:
+                raise ValueError(f"Unknown IC-LoRA model key: {required_lora_key}")
+            keep_existing_ic_lora = (
+                ic_lora_model_key is None
+                and preset.distilled_lora_path
+                and preset.distilled_lora_path != "None"
+                and Path(preset.distilled_lora_path).exists()
+            )
+        else:
+            required_lora_key = DEFAULT_DISTILLED_LORA_KEY
         required_lora_name = CHECKPOINTS[required_lora_key]["filename"]
-        if (
+        if not keep_existing_ic_lora and (
             not preset.distilled_lora_path
             or preset.distilled_lora_path == "None"
             or Path(preset.distilled_lora_path).name != required_lora_name
@@ -849,6 +918,25 @@ class GenerationRequest(BaseModel):
         default=None, 
         description="Video conditioning inputs for IC-LoRA (depth maps, pose, edges)"
     )
+    ic_lora_model_key: Optional[str] = Field(default=None, description="CHECKPOINTS key for the IC-LoRA adapter")
+    ic_lora_strength: Optional[float] = Field(default=None, ge=0.0, le=2.0, description="IC-LoRA adapter strength")
+    ic_lora_attention_strength: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Reference/control attention strength for IC-LoRA",
+    )
+    ic_lora_reference_strength: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Reference video latent conditioning strength",
+    )
+    ic_lora_reference_image_base64: Optional[str] = Field(
+        default=None,
+        description="Base64 encoded still reference image to loop into an IC-LoRA reference video",
+    )
+    ic_lora_reference_image_filename: Optional[str] = Field(default=None, description="Original reference image filename")
     
     # Legacy single image support (backward compatible)
     input_image_base64: Optional[str] = Field(default=None, description="Base64 encoded input image (legacy)")
@@ -877,6 +965,7 @@ class PresetCreate(BaseModel):
     enable_fp8: bool = Field(default=True)
     skip_memory_cleanup: bool = Field(default=True)
     image_strength: float = Field(default=1.0, ge=0.0, le=1.0)
+    lora_strength: float = Field(default=1.0, ge=0.0, le=2.0)
 
 
 class PresetResponse(BaseModel):
@@ -897,6 +986,7 @@ class PresetResponse(BaseModel):
     enable_fp8: bool
     skip_memory_cleanup: bool
     image_strength: float
+    lora_strength: float = 1.0
     # Model paths
     checkpoint_path: Optional[str] = None
     spatial_upsampler_path: Optional[str] = None
@@ -950,6 +1040,7 @@ class PipelineManager:
             "spatial_upsampler_path": None,
             "gemma_path": None,
             "distilled_lora_path": None,
+            "lora_strength": None,
             "enable_fp8": None,
         }
     
@@ -985,6 +1076,7 @@ class PipelineManager:
                 "spatial_upsampler_path": None,
                 "gemma_path": None,
                 "distilled_lora_path": None,
+                "lora_strength": None,
                 "enable_fp8": None,
             }
         )
@@ -1029,6 +1121,7 @@ class PipelineManager:
             and cache["spatial_upsampler_path"] == _normalize_path(preset.spatial_upsampler_path)
             and cache["gemma_path"] == _normalize_path(preset.gemma_path)
             and cache["distilled_lora_path"] == _normalize_path(preset.distilled_lora_path)
+            and cache["lora_strength"] == float(getattr(preset, "lora_strength", 1.0))
             and cache["enable_fp8"] == preset.enable_fp8
         )
         
@@ -1085,6 +1178,7 @@ class PipelineManager:
                 gemma_path=preset.gemma_path,
                 lora_path=preset.distilled_lora_path,
                 enable_fp8=preset.enable_fp8,
+                lora_strength=float(getattr(preset, "lora_strength", 1.0)),
             )
             
             # Cache the pipeline with normalized paths for reliable future comparisons
@@ -1094,6 +1188,7 @@ class PipelineManager:
             cache["spatial_upsampler_path"] = _normalize_path(preset.spatial_upsampler_path)
             cache["gemma_path"] = _normalize_path(preset.gemma_path)
             cache["distilled_lora_path"] = _normalize_path(preset.distilled_lora_path)
+            cache["lora_strength"] = float(getattr(preset, "lora_strength", 1.0))
             cache["enable_fp8"] = preset.enable_fp8
             print(f"[PipelineManager] Pipeline cached: type={preset.pipeline_type}, fp8={preset.enable_fp8}")
             
@@ -1341,6 +1436,28 @@ async def generate_video_stream(request: GenerationRequest):
                     f.write(video_data)
                 video_conditioning_inputs.append((video_path, vid_input.strength))
 
+        if request.ic_lora_reference_image_base64:
+            image_data = base64.b64decode(request.ic_lora_reference_image_base64)
+            image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            suffix = Path(request.ic_lora_reference_image_filename or "").suffix.lower()
+            if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+                suffix = ".png"
+            image_path = str(temp_dir / f"ic_lora_ref_{uuid.uuid4().hex[:8]}{suffix}")
+            image.save(image_path)
+            target_width = request.width if request.width is not None else preset.width
+            target_height = request.height if request.height is not None else preset.height
+            target_frames = request.num_frames if request.num_frames is not None else preset.num_frames
+            target_fps = request.frame_rate if request.frame_rate is not None else preset.frame_rate
+            video_path = _create_static_reference_video(
+                image_path=image_path,
+                width=int(target_width),
+                height=int(target_height),
+                num_frames=int(target_frames),
+                frame_rate=float(target_fps),
+                temp_dir=temp_dir,
+            )
+            video_conditioning_inputs.append((video_path, float(request.ic_lora_reference_strength)))
+
         if request.audio_base64:
             audio_data = base64.b64decode(request.audio_base64)
             suffix = Path(request.audio_filename or "").suffix.lower()
@@ -1511,6 +1628,8 @@ def _generate_video_internal(
         preset.enable_fp8 = request.enable_fp8
     if request.skip_memory_cleanup is not None:
         preset.skip_memory_cleanup = request.skip_memory_cleanup
+    if request.ic_lora_strength is not None:
+        preset.lora_strength = request.ic_lora_strength
 
     if preset.pipeline_type in LTX23_SPECIALIZED_PIPELINE_TYPES:
         raise ValueError(
@@ -1522,7 +1641,7 @@ def _generate_video_internal(
     
     # Auto-download required models if not present
     try:
-        checkpoint_path, upsampler_path = auto_download_required_models(preset)
+        checkpoint_path, upsampler_path = auto_download_required_models(preset, request.ic_lora_model_key)
         preset.checkpoint_path = checkpoint_path
         preset.spatial_upsampler_path = upsampler_path
     except Exception as e:
@@ -1578,6 +1697,8 @@ def _generate_video_internal(
     
     # Use video conditioning inputs for IC-LoRA (list of (path, strength))
     video_conditioning = video_conditioning_inputs if video_conditioning_inputs else []
+    if preset.pipeline_type == "ic_lora" and not video_conditioning:
+        raise ValueError("IC-LoRA generation requires a reference image, reference video, or control-signal video.")
     
     # Import utilities
     from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
@@ -1672,6 +1793,11 @@ def _generate_video_internal(
                 images=images,
                 video_conditioning=video_conditioning,
                 tiling_config=tiling_config,
+                conditioning_attention_strength=float(
+                    request.ic_lora_attention_strength
+                    if request.ic_lora_attention_strength is not None
+                    else 1.0
+                ),
                 enhance_prompt=False,
             )
         elif preset.pipeline_type == "ti2vid_one_stage":
@@ -1826,6 +1952,7 @@ async def list_presets():
                 enable_fp8=preset.enable_fp8,
                 skip_memory_cleanup=preset.skip_memory_cleanup,
                 image_strength=preset.image_strength,
+                lora_strength=getattr(preset, "lora_strength", 1.0),
                 checkpoint_path=preset.checkpoint_path,
                 spatial_upsampler_path=preset.spatial_upsampler_path,
                 distilled_lora_path=preset.distilled_lora_path,
@@ -1861,6 +1988,7 @@ async def get_preset(preset_name: str):
         enable_fp8=preset.enable_fp8,
         skip_memory_cleanup=preset.skip_memory_cleanup,
         image_strength=preset.image_strength,
+        lora_strength=getattr(preset, "lora_strength", 1.0),
         checkpoint_path=preset.checkpoint_path,
         spatial_upsampler_path=preset.spatial_upsampler_path,
         distilled_lora_path=preset.distilled_lora_path,
@@ -1895,6 +2023,7 @@ async def create_preset(preset_data: PresetCreate):
         enable_fp8=preset_data.enable_fp8,
         skip_memory_cleanup=preset_data.skip_memory_cleanup,
         image_strength=preset_data.image_strength,
+        lora_strength=preset_data.lora_strength,
     )
     
     preset_manager.save_preset(preset)
@@ -1916,6 +2045,7 @@ async def create_preset(preset_data: PresetCreate):
         enable_fp8=preset.enable_fp8,
         skip_memory_cleanup=preset.skip_memory_cleanup,
         image_strength=preset.image_strength,
+        lora_strength=getattr(preset, "lora_strength", 1.0),
         checkpoint_path=preset.checkpoint_path,
         spatial_upsampler_path=preset.spatial_upsampler_path,
         distilled_lora_path=preset.distilled_lora_path,
@@ -1951,6 +2081,7 @@ async def update_preset(preset_name: str, preset_data: PresetCreate):
         enable_fp8=preset_data.enable_fp8,
         skip_memory_cleanup=preset_data.skip_memory_cleanup,
         image_strength=preset_data.image_strength,
+        lora_strength=preset_data.lora_strength,
     )
     preset.created_at = existing.created_at
     
@@ -1973,6 +2104,7 @@ async def update_preset(preset_name: str, preset_data: PresetCreate):
         enable_fp8=preset.enable_fp8,
         skip_memory_cleanup=preset.skip_memory_cleanup,
         image_strength=preset.image_strength,
+        lora_strength=getattr(preset, "lora_strength", 1.0),
         checkpoint_path=preset.checkpoint_path,
         spatial_upsampler_path=preset.spatial_upsampler_path,
         distilled_lora_path=preset.distilled_lora_path,

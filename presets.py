@@ -44,6 +44,7 @@ class GenerationPreset:
     
     # Image/video conditioning defaults
     image_strength: float = 1.0
+    lora_strength: float = 1.0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -197,6 +198,7 @@ class PresetManager:
         enable_fp8: bool = True,
         skip_memory_cleanup: bool = True,
         image_strength: float = 1.0,
+        lora_strength: float = 1.0,
     ) -> GenerationPreset:
         """Create a preset from individual settings (no prompt - that's a generation input)."""
         preset = GenerationPreset(
@@ -217,6 +219,7 @@ class PresetManager:
             enable_fp8=enable_fp8,
             skip_memory_cleanup=skip_memory_cleanup,
             image_strength=image_strength,
+            lora_strength=lora_strength,
         )
         return preset
 
