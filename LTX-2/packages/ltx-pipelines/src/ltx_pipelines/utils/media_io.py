@@ -509,7 +509,7 @@ def decode_audio_from_file(
         start_time: Start time in seconds to begin reading audio from.
         max_duration: Maximum audio duration in seconds. If None, reads to end of stream.
     Returns:
-        An Audio object with waveform of shape (1, channels, samples), or None if no audio stream.
+        An Audio object with a stereo waveform of shape (1, 2, samples), or None if no audio stream.
     """
     container = av.open(path)
     try:
@@ -556,6 +556,14 @@ def decode_audio_from_file(
     if max_duration is not None:
         max_samples = round(max_duration * sample_rate)
         audio = audio[..., :max_samples]
+
+    # Production LTX audio checkpoints are stereo and their first convolution expects
+    # exactly two input channels. Speech/reference audio is commonly mono, so mirror
+    # its single channel rather than letting the audio VAE fail with a channel mismatch.
+    if audio.shape[0] == 1:
+        audio = np.repeat(audio, 2, axis=0)
+    elif audio.shape[0] != 2:
+        raise ValueError(f"Expected mono or stereo audio; got {audio.shape[0]} channels from {path}.")
 
     waveform = torch.from_numpy(audio).to(device).unsqueeze(0)
 
