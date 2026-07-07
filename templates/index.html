@@ -1356,7 +1356,7 @@
                                 <div class="form-group">
                                     <label for="gemmaPath">Gemma Model Path</label>
                                     <input type="text" id="gemmaPath" value="models/gemma" placeholder="models/gemma">
-                                    <div class="form-hint">Path to Gemma 3 12B QAT text encoder (pre-downloaded by run.sh).</div>
+                                    <div class="form-hint">Path to Gemma 3 12B QAT text encoder (downloaded on first use if missing).</div>
                                 </div>
                             </div>
                         </div>
@@ -1546,7 +1546,7 @@
                                 <span style="color: var(--text-secondary);">
                                     If no preset is specified, uses the "default" preset: <code>distilled</code> pipeline, 
                                     1536×1024, 121 frames @ 24fps, FP8 enabled. Only <code>prompt</code> is required.
-                                    Pre-downloaded models: <code>ltx-2.3-22b-distilled-1.1</code>, <code>ltx-2.3-spatial-upscaler-x2-1.1</code>, Gemma 3 12B QAT.
+                                    Default models are downloaded on demand: <code>ltx-2.3-22b-distilled-1.1</code>, <code>ltx-2.3-spatial-upscaler-x2-1.1</code>, Gemma 3 12B QAT.
                                 </span>
                             </div>
                             <h4 style="margin-bottom: 0.5rem;">Request Body</h4>
@@ -1670,7 +1670,7 @@ data: {"type": "done"}</code></pre>
                             </p>
                             <h4 style="margin-bottom: 0.5rem;">Response</h4>
                             <pre style="background: var(--bg-dark); padding: 1rem; border-radius: 8px; overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem;"><code>{
-  "ltx-2.3-22b-distilled-1.1": {         // ⭐ Pre-downloaded by run.sh
+  "ltx-2.3-22b-distilled-1.1": {         // Downloaded on demand
     "filename": "ltx-2.3-22b-distilled-1.1.safetensors",
     "size": "27.1 GB",
     "description": "LTX-2.3 distilled model (fast inference)",
@@ -1678,7 +1678,7 @@ data: {"type": "done"}</code></pre>
     "status": "ready",
     "path": "./models/checkpoints/ltx-2.3-22b-distilled-1.1.safetensors"
   },
-  "ltx-2.3-spatial-upscaler-x2-1.1": {   // ⭐ Pre-downloaded by run.sh
+  "ltx-2.3-spatial-upscaler-x2-1.1": {   // Downloaded on demand
     "filename": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
     "size": "996 MB",
     "description": "2x spatial upscaler",
@@ -1697,7 +1697,7 @@ data: {"type": "done"}</code></pre>
   // ... more models
 }</code></pre>
                             <div style="background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.3); border-radius: 8px; padding: 0.75rem; margin: 1rem 0;">
-                                <strong style="color: var(--accent-green);">⭐ Pre-downloaded (via run.sh):</strong>
+                                <strong style="color: var(--accent-green);">On-demand defaults:</strong>
                                 <span style="color: var(--text-secondary);">
                                     <code>ltx-2.3-22b-distilled-1.1</code>, <code>ltx-2.3-spatial-upscaler-x2-1.1</code>, and Gemma 3 12B QAT text encoder
                                 </span>
@@ -1759,9 +1759,9 @@ data: {"type": "done"}</code></pre>
     "gemma_path": "models/gemma"       // Gemma 3 12B QAT text encoder
   }
 ]</code></pre>
-                            <h4 style="margin-top: 1rem; margin-bottom: 0.5rem;">Pre-downloaded Models (via run.sh)</h4>
+                            <h4 style="margin-top: 1rem; margin-bottom: 0.5rem;">Default On-demand Models</h4>
                             <p style="color: var(--text-secondary); margin-bottom: 0.5rem;">
-                                The <code>run.sh</code> script automatically downloads these models on first run:
+                                The API automatically downloads these models during the first generation that needs them:
                             </p>
                             <ul style="color: var(--text-secondary); margin-left: 1.5rem; margin-bottom: 1rem;">
                                 <li><strong>Checkpoint:</strong> <code>ltx-2.3-22b-distilled-1.1.safetensors</code> → <code>./models/checkpoints/</code></li>

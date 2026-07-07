@@ -1009,7 +1009,7 @@ def create_ui():
                         # Model Selection
                         with gr.Group():
                             gr.Markdown("### 📦 Models")
-                            gr.Markdown("*Models are auto-downloaded on first run*", elem_classes=["text-muted"])
+                            gr.Markdown("*FastAPI downloads models on demand; use the Models tab here for manual downloads.*", elem_classes=["text-muted"])
                             
                             checkpoint_path = gr.Dropdown(
                                 choices=get_checkpoint_choices(),
@@ -1035,7 +1035,7 @@ def create_ui():
                             # Auto-detect Gemma path
                             default_gemma = "./models/gemma" if (MODELS_DIR / "gemma").exists() else "./models/gemma"
                             gemma_path = gr.Textbox(
-                                label="Gemma Path (auto-downloaded)",
+                                label="Gemma Path",
                                 value=default_gemma,
                                 placeholder="./models/gemma"
                             )
@@ -1579,7 +1579,7 @@ def create_ui():
                 
                 #### 🚀 Quick Start
                 
-                Run `./run.sh` and all required models will be automatically downloaded:
+                Run `./run.sh` to install dependencies and start the API. Required models are downloaded on first generation:
                 
                 - ✅ LTX-2.3 22B Distilled Checkpoint
                 - ✅ Gemma 3 12B QAT Text Encoder (no HF token required)
@@ -1633,14 +1633,14 @@ def create_ui():
                 
                 ---
                 
-                #### First-Time Setup (if not using run.sh)
+                #### First-Time Setup
                 
-                1. **Run the launcher** (downloads all models automatically):
+                1. **Run the launcher** (downloads models on demand):
                    ```bash
                    ./run.sh
                    ```
                    
-                2. Or download models manually:
+                2. Or pre-download models manually / with `./run.sh --with-models`:
                    ```bash
                    # Gemma 3 12B QAT (no token required)
                    huggingface-cli download Lightricks/gemma-3-12b-it-qat-q4_0-unquantized --local-dir ./models/gemma

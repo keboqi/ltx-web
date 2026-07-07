@@ -8,7 +8,19 @@ A web interface and REST API for [Lightricks LTX-2](https://github.com/Lightrick
 ./run.sh
 ```
 
-The launcher installs WebUI dependencies, installs the vendored LTX-2 packages from `LTX-2/packages`, downloads the default LTX-2.3 models, and starts the FastAPI UI at `http://localhost:8000`.
+The launcher installs WebUI dependencies, installs the vendored LTX-2 packages from `LTX-2/packages`, and starts the FastAPI UI at `http://localhost:8000`. Model weights are downloaded on demand during the first generation that needs them.
+
+To prepare the environment without starting the API:
+
+```bash
+./run.sh --no-launch
+```
+
+To pre-download the default LTX-2.3 weights during setup:
+
+```bash
+./run.sh --with-models
+```
 
 ## Default Models
 
@@ -18,7 +30,7 @@ The launcher installs WebUI dependencies, installs the vendored LTX-2 packages f
 | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | `Lightricks/LTX-2.3` | `models/upsamplers/` |
 | Gemma 3 12B QAT | `Lightricks/gemma-3-12b-it-qat-q4_0-unquantized` | `models/gemma/` |
 
-Manual download commands:
+The API can download these files automatically on first use. Manual download commands:
 
 ```bash
 huggingface-cli download Lightricks/gemma-3-12b-it-qat-q4_0-unquantized --local-dir ./models/gemma

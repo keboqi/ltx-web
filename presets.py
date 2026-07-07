@@ -24,7 +24,7 @@ class GenerationPreset:
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
     
-    # Pipeline settings (defaults match pre-downloaded models from run.sh)
+    # Pipeline settings. Defaults point to the models downloaded on first use.
     pipeline_type: str = "distilled"
     checkpoint_path: str = f"models/checkpoints/{DEFAULT_CHECKPOINT_CANDIDATES[0]}"
     distilled_lora_path: str = "None"
@@ -95,7 +95,7 @@ class PresetManager:
     def _create_default_preset(self):
         """Create the default preset with sensible defaults.
         
-        Uses pre-downloaded models from run.sh:
+        Uses the default on-demand model locations:
         - Checkpoint: LTX-2.3 distilled 22B
         - Upsampler: LTX-2.3 spatial upscaler x2
         - Text encoder: Gemma 3 12B QAT
